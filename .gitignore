@@ -1,1 +1,6 @@
+# ── Python artefacts ───────────────────────────────────────────────
 _pycache_/*
+*.py[cod]
+*.egg-info/
+dist/
+build/
