@@ -6,6 +6,8 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
+import json
+
 QUEUE = None  # will be injected by trainer.py
 
 
@@ -57,7 +59,12 @@ class ChessEnvSingle(gym.Env):
 
         # -------- Optional “viewer” stream ------------------------------------
         if QUEUE is not None:
-            QUEUE.put(self.board)
+            QUEUE.put(json.dumps({
+                "game": 0,                       # or self.game_id if you have one
+                "fen": self.board.fen(),         # current board position
+                "move": desired_uci,             # move just played
+                "result": None                   # fill when game is over
+            }))
 
         # -------- Opponent (very weak) ----------------------------------------
         if not self.board.is_game_over():

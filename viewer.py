@@ -1,145 +1,97 @@
-# viewer.py
-"""
-Live, colorful chess-board viewer
-─────────────────────────────────
-Drop‐in replacement for your previous ``viewer.py``.
-
-How it works
-============
-The training code should push either
-
-• a *chess.Board* instance **or**
-• a *uci-string* (e.g. ``"e2e4"``)
-
-onto the shared queue.  
-This viewer keeps its own local ``board``.  When it receives a move
-(string) it plays the move on that board; when it receives a
-``chess.Board`` object it resets its local copy to that position.
-
-After every update a pretty, Unicode-based board is rendered with
-ANSI colours plus the last move (in SAN) underneath.
-
-If you run this in a Windows terminal you may need
-``colorama.just_fix_windows_console()`` to get colours.
-"""
-
+# viewer.py ─ show every move, one board, no flicker
 from __future__ import annotations
+import json, queue, sys, time, pygame, chess, threading
+from colorama import Fore, Style, init as _cinit
+_cinit(autoreset=True)
 
-import json
-import queue
-import threading
-import time
-from typing import Any, Optional
+# ───── constants ──────────────────────────────────────────────────────────
+SQ = 72; BOARD_PX = 8*SQ
+LIGHT, DARK = (240,217,181), (181,136, 99)
+FRAME = (70,70,70); FPS = 60
+UNICODE = {"P":"♙","N":"♘","B":"♗","R":"♖","Q":"♕","K":"♔",
+           "p":"♟","n":"♞","b":"♝","r":"♜","q":"♛","k":"♚"}
+QUEUE: "queue.Queue[str]|None" = None
 
-import chess
-from colorama import Fore, Back, Style, init as _colorama_init
+# ───── helpers ────────────────────────────────────────────────────────────
+_font_cache:dict[int,pygame.font.Font]={}
+def _font(sz:int)->pygame.font.Font:
+    if sz not in _font_cache:
+        _font_cache[sz] = pygame.font.SysFont("DejaVuSans", sz, bold=True)
+    return _font_cache[sz]
 
-# ── colour initialisation (no-op on real ANSI terminals) ───────────────
-_colorama_init()
+def _background()->pygame.Surface:
+    surf=pygame.Surface((BOARD_PX,BOARD_PX))
+    surf.fill(FRAME)
+    for r in range(8):
+        for c in range(8):
+            col = LIGHT if (r+c)&1 else DARK
+            pygame.draw.rect(surf,col,(c*SQ,r*SQ,SQ,SQ))
+    return surf
 
-_WHITE_SQUARE = Back.LIGHTWHITE_EX + "  " + Style.RESET_ALL
-_BLACK_SQUARE = Back.LIGHTBLACK_EX + "  " + Style.RESET_ALL
+def _piece_imgs()->dict[str,pygame.Surface]:
+    imgs={}
+    for sym,uni in UNICODE.items():
+        col=(255,255,255) if sym.isupper() else (25,25,25)
+        txt=_font(int(SQ*0.8)).render(uni,True,col)
+        s=pygame.Surface((SQ,SQ),pygame.SRCALPHA); s.blit(txt,txt.get_rect(center=(SQ//2,SQ//2)))
+        imgs[sym]=s
+    return imgs
 
-# Unicode pieces keyed by *piece.symbol()*
-_PIECE_TO_UNICODE_COLOURED = {
-    "P": Fore.BLACK + "♙ " + Style.RESET_ALL,
-    "N": Fore.BLACK + "♘ " + Style.RESET_ALL,
-    "B": Fore.BLACK + "♗ " + Style.RESET_ALL,
-    "R": Fore.BLACK + "♖ " + Style.RESET_ALL,
-    "Q": Fore.BLACK + "♕ " + Style.RESET_ALL,
-    "K": Fore.BLACK + "♔ " + Style.RESET_ALL,
-    "p": Fore.WHITE + "♟︎ " + Style.RESET_ALL,
-    "n": Fore.WHITE + "♞ " + Style.RESET_ALL,
-    "b": Fore.WHITE + "♝ " + Style.RESET_ALL,
-    "r": Fore.WHITE + "♜ " + Style.RESET_ALL,
-    "q": Fore.WHITE + "♛ " + Style.RESET_ALL,
-    "k": Fore.WHITE + "♚ " + Style.RESET_ALL,
-}
+# ───── viewer main loop ───────────────────────────────────────────────────
+def view_moves(shared:queue.Queue[str])->None:
+    global QUEUE; QUEUE=shared
+    pygame.init(); win=pygame.display.set_mode((BOARD_PX,BOARD_PX))
+    pygame.display.set_caption("Chess Viewer"); clock=pygame.time.Clock()
 
+    back   = _background();  piece_img=_piece_imgs()
+    board  : chess.Board|None=None
+    last   : dict[int,chess.Piece]={}
 
-def _render_board(board: chess.Board, last_move: Optional[chess.Move] = None) -> str:
-    """Return a coloured, Unicode drawing of *board*.  White at bottom."""
-    ranks = []
-    for rank in range(7, -1, -1):                       # 7 → 0
-        squares = []
-        for file in range(8):
-            sq = chess.square(file, rank)
-            piece = board.piece_at(sq)
+    running=True
+    while running:
+        # pull **one** message (blocking ≤1/FPS s) so we repaint each ply
+        try: raw=QUEUE.get(timeout=1/FPS)
+        except queue.Empty: raw=None
 
-            # choose square colour
-            base = _WHITE_SQUARE if (file + rank) % 2 == 0 else _BLACK_SQUARE
-            if piece:
-                sym = piece.symbol()
-                piece_txt = _PIECE_TO_UNICODE_COLOURED[sym]
-                cell = Back.RESET + piece_txt + Style.RESET_ALL
+        if raw:
+            try: fen=json.loads(raw)["fen"]
+            except Exception as e:
+                print(Fore.RED+f"[viewer] bad msg: {e}"+Style.RESET_ALL); continue
+
+            # start/replace board when new game or first FEN
+            if board is None or board.is_game_over():
+                board=chess.Board(fen); last={}
+                back=_background()      # fresh clean board
             else:
-                cell = base
-            squares.append(cell)
-        ranks.append(f"{rank + 1} " + "".join(squares) + " ")
-    files = "   a b c d e f g h"
-    bar = "\n"
-    board_str = bar.join(ranks) + bar + files
+                board.set_fen(fen)
 
-    if last_move:
-        board_str += f"\nLast move: {board.san(last_move)}"
-    return board_str
+            new_map=board.piece_map()
+            changed={sq for sq in set(last)|set(new_map) if last.get(sq)!=new_map.get(sq)}
+            last=new_map
 
+            for sq in changed:
+                r,c=divmod(sq,8)
+                col = LIGHT if (r+c)&1 else DARK
+                pygame.draw.rect(back,col,(c*SQ,r*SQ,SQ,SQ))
+                if piece:=new_map.get(sq):
+                    back.blit(piece_img[piece.symbol()],(c*SQ,r*SQ))
 
-def view_moves(msg_queue: queue.Queue[Any], poll: float = 0.05) -> None:
-    """Continuously read queue and render the board beautifully."""
-    board = chess.Board()
-    last_move: Optional[chess.Move] = None
+            win.blit(back,(0,0))
+            pygame.display.flip()         # immediate render after this move
 
-    while True:
-        try:
-            msg = msg_queue.get_nowait()
-        except queue.Empty:
-            time.sleep(poll)
-            continue
+        # handle quit
+        for ev in pygame.event.get():
+            if ev.type==pygame.QUIT: running=False
+        clock.tick(FPS)
 
-        # -------- interpret message --------------------------------------
-        if isinstance(msg, chess.Board):
-            board = msg.copy(stack=False)
-            last_move = None
+    pygame.quit(); sys.exit()
 
-        elif isinstance(msg, (bytes, bytearray)):
-            # assume bytes containing UCI
-            try:
-                move = board.parse_uci(msg.decode().strip())
-            except ValueError:
-                pass
-            else:
-                board.push(move)
-                last_move = move
-
-        elif isinstance(msg, str):
-            try:
-                content = json.loads(msg)
-            except json.JSONDecodeError:
-                # plain UCI?
-                try:
-                    move = board.parse_uci(msg.strip())
-                except ValueError:
-                    # ignore unknown message
-                    continue
-                else:
-                    board.push(move)
-                    last_move = move
-            else:
-                # JSON – if it contains FEN, sync board
-                if "fen" in content:
-                    board = chess.Board(content["fen"])
-                    last_move = None
-
-        # Anything else we ignore quietly.
-
-        # -------- render -------------------------------------------------
-        print("\033[H\033[J", end="")            # clear screen (ANSI)
-        print(_render_board(board, last_move), flush=True)
-
-
-def start_viewer_thread(msg_queue: queue.Queue[Any]) -> threading.Thread:
-    """Start the viewer in a daemon thread so it terminates with main."""
-    t = threading.Thread(target=view_moves, args=(msg_queue,), daemon=True)
-    t.start()
-    return t
+# standalone quick-test
+if __name__=="__main__":
+    import multiprocessing as mp, random
+    q=mp.Manager().Queue()
+    threading.Thread(target=view_moves,args=(q,),daemon=True).start()
+    b=chess.Board(); q.put(json.dumps({"fen":b.fen()}))
+    while not b.is_game_over():
+        b.push(random.choice(list(b.legal_moves)))
+        q.put(json.dumps({"fen":b.fen()})); time.sleep(0.3)
